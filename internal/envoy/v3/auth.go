@@ -14,6 +14,10 @@
 package v3
 
 import (
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	envoy_api_v3_core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoy_v3_tls "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	envoy_extensions_upstream_http_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
@@ -72,11 +76,49 @@ func validationContext(ca []byte, subjectName string, skipVerifyPeerCert bool) *
 	}
 
 	if len(ca) > 0 {
-		vc.ValidationContext.TrustedCa = &envoy_api_v3_core.DataSource{
-			// TODO(dfc) update this for SDS
-			Specifier: &envoy_api_v3_core.DataSource_InlineBytes{
-				InlineBytes: ca,
-			},
+		// We either support a CA chain, or individual self signed certificates, but not both. If all the certificates
+		// in the CA data can be correctly parsed as non CA certificates, we calculate their SPKI hash, and pass them
+		// to Envoy to do exact matches. Otherwise, we pass as is, and let Envoy handle if the CA data doesn't make
+		// sense.
+		allSelfSigned := true
+		var spkiHashes []string
+
+		block, remaining := pem.Decode(ca)
+		for block != nil {
+			if block.Type != "CERTIFICATE" {
+				allSelfSigned = false
+				break
+			}
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				allSelfSigned = false
+				break
+			}
+			if cert.IsCA && (cert.KeyUsage & x509.KeyUsageCertSign != 0) {
+				allSelfSigned = false
+				break
+			}
+			spkiBytes, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+			if err != nil {
+				allSelfSigned = false
+				break
+			}
+			spkiHashBytes := sha256.Sum256(spkiBytes)
+			spkiHash := base64.StdEncoding.EncodeToString(spkiHashBytes[:])
+			spkiHashes = append(spkiHashes, spkiHash)
+
+			block, remaining = pem.Decode(remaining)
+		}
+
+		if len(spkiHashes) > 0 && allSelfSigned {
+			vc.ValidationContext.VerifyCertificateSpki = spkiHashes
+		} else {
+			vc.ValidationContext.TrustedCa = &envoy_api_v3_core.DataSource{
+				// TODO(dfc) update this for SDS
+				Specifier: &envoy_api_v3_core.DataSource_InlineBytes{
+					InlineBytes: ca,
+				},
+			}
 		}
 	}
 
